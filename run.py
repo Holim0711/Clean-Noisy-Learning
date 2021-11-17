@@ -71,7 +71,7 @@ def test(config, args):
         transforms={'val': get_trfms(config['transform']['val'])},
         batch_sizes={'val': config['dataset']['batch_sizes']['val']},
     )
-    model = FixMatchClassifier.load_from_checkpoint(args.ckpt_path)
+    model = NoisyFlexMatchClassifier.load_from_checkpoint(args.ckpt_path)
     trainer.test(model, dm)
 
 
