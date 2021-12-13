@@ -2,6 +2,7 @@ import os
 import json
 import argparse
 
+import torch
 from pytorch_lightning import Trainer
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
@@ -46,20 +47,24 @@ def train(config, args):
         noise_type=args.noise_type,
         noise_ratio=args.noise_ratio,
         transforms={
-            'labeled': transform_w,
-            'unlabeled': NqTwinTransform(transform_s, transform_w),
+            'clean': transform_w,
+            'noisy': NqTwinTransform(transform_s, transform_w),
             'val': transform_v
         },
         batch_sizes={
-            'labeled': config['dataset']['batch_sizes']['labeled'] // nd,
-            'unlabeled': config['dataset']['batch_sizes']['unlabeled'] // nd,
+            'clean': config['dataset']['batch_sizes']['clean'] // nd,
+            'noisy': config['dataset']['batch_sizes']['noisy'] // nd,
             'val': config['dataset']['batch_sizes']['val'],
         },
         random_seed=args.random_seed,
-        show_indices=True,
+        show_sample_indices=True,
     )
+    dm.prepare_data()
+    dm.setup()
+    ỹ = [x[0] for x in dm.datasets['noisy'].dataset.targets]
+    T = dm.T    # T = torch.load(args.transition_matrix)
 
-    model = NoisyFlexMatchClassifier(**config)
+    model = NoisyFlexMatchClassifier(ỹ, T, **config)
     trainer.fit(model, dm)
 
 
@@ -79,10 +84,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('mode', choices=['train', 'test'])
     parser.add_argument('config', type=str)
-    parser.add_argument('--n', type=int)
-    parser.add_argument('--noise_type', type=str)
-    parser.add_argument('--noise_ratio', type=float)
+    parser.add_argument('--n', type=int, default=40)
+    parser.add_argument('--noise_type', type=str, default='symmetric')
+    parser.add_argument('--noise_ratio', type=float, default=0.2)
     parser.add_argument('--random_seed', type=int, default=1234)
+    # parser.add_argument('--transition_matrix', type=str)
     parser.add_argument('--ckpt_path', type=str)
     parser = Trainer.add_argparse_args(parser)
 

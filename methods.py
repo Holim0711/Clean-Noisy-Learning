@@ -15,44 +15,33 @@ class AveragedModelWithBuffers(torch.optim.swa_utils.AveragedModel):
             a.copy_(b.to(a.device))
 
 
-class FixMatchCrossEntropy(torch.nn.Module):
-    def __init__(self, temperature=1.0, threshold=0.95, reduction='mean'):
+class NoisyFlexMatchCrossEntropy(torch.nn.Module):
+    def __init__(self, num_classes, num_samples, ỹ, T,
+                 temperature, threshold, reduction='mean'):
         super().__init__()
+        self.num_classes = num_classes
+        self.num_samples = num_samples
         self.threshold = threshold
         self.temperature = temperature
         self.reduction = reduction
         self.𝜇ₘₐₛₖ = None
-
-    def forward(self, logits_s, logits_w, *_):
-        probs = torch.softmax(logits_w / self.temperature, dim=-1)
-        max_probs, targets = probs.max(dim=-1)
-        masks = (max_probs > self.threshold).float()
-
-        loss = torch.nn.functional.cross_entropy(
-            logits_s, targets, reduction='none') * masks
-        self.𝜇ₘₐₛₖ = masks.mean().detach()
-
-        if self.reduction == 'mean':
-            return loss.mean()
-        elif self.reduction == 'sum':
-            return loss.sum()
-        return loss
-
-
-class NoisyFlexMatchCrossEntropy(FixMatchCrossEntropy):
-    def __init__(self, num_classes, num_samples, **kwargs):
-        super().__init__(**kwargs)
-        self.num_classes = num_classes
-        self.num_samples = num_samples
         self.register_buffer('ŷ', torch.tensor([num_classes] * num_samples))
+        self.register_buffer('ỹ', torch.tensor(ỹ))
+        self.register_buffer('T', torch.tensor(T))
 
     def all_gather(self, x, world_size):
         x_list = [torch.zeros_like(x) for _ in range(world_size)]
         torch.distributed.all_gather(x_list, x)
         return torch.hstack(x_list)
 
-    def forward(self, logits_s, logits_w, noisy_targets, i):
+    def forward(self, logits_s, logits_w, ỹ, i):
+        ỹŷ = torch.zeros((self.num_classes, self.num_classes + 1))
+        ỹŷ.index_put_((self.ỹ, self.ŷ), torch.ones(self.num_samples), True)
+        ỹŷ = ỹŷ[:, :-1] + ỹŷ[:, -1].diag()
+        ỹŷ /= ỹŷ.sum(axis=0)
+
         probs = torch.softmax(logits_w / self.temperature, dim=-1)
+        probs = probs * self.T[:, ỹ].t() / ỹŷ[ỹ].to(probs.device)
         max_probs, targets = probs.max(dim=-1)
 
         β = self.ŷ.bincount()
@@ -96,9 +85,10 @@ def replace_relu(model):
 
 class NoisyFlexMatchClassifier(pl.LightningModule):
 
-    def __init__(self, **kwargs):
+    def __init__(self, noisy_targets, transition_matrix, **kwargs):
         super().__init__()
-        self.save_hyperparameters()
+        for k in kwargs:
+            self.save_hyperparameters(k)
 
         self.model = get_model(**self.hparams.model['backbone'])
         change_bn(self.model, self.hparams.model['momentum'])
@@ -107,6 +97,8 @@ class NoisyFlexMatchClassifier(pl.LightningModule):
         self.criterionᵤ = NoisyFlexMatchCrossEntropy(
             num_classes=self.hparams.model['backbone']['num_classes'],
             num_samples=50000,
+            ỹ=noisy_targets,
+            T=transition_matrix,
             **self.hparams.model['loss_u']
         )
         self.train_acc = Accuracy()
@@ -118,8 +110,8 @@ class NoisyFlexMatchClassifier(pl.LightningModule):
         self.ema = AveragedModelWithBuffers(self.model, avg_fn=avg_fn)
 
     def training_step(self, batch, batch_idx):
-        iₗ, (xₗ, yₗ) = batch['labeled']
-        iᵤ, ((ˢxᵤ, ʷxᵤ), (ỹ, _)) = batch['unlabeled']
+        xₗ, yₗ = batch['clean']
+        iᵤ, ((ˢxᵤ, ʷxᵤ), (ỹ, _)) = batch['noisy']
 
         z = self.model(torch.cat((xₗ, ˢxᵤ, ʷxᵤ)))
         zₗ = z[:xₗ.shape[0]]
@@ -182,7 +174,7 @@ class NoisyFlexMatchClassifier(pl.LightningModule):
 
     @property
     def steps_per_epoch(self) -> int:
-        num_iter = len(self.train_dataloader()['unlabeled'])
+        num_iter = len(self.train_dataloader()['noisy'])
         num_accum = self.trainer.accumulate_grad_batches
         return num_iter // (num_accum * self.num_devices)
 
