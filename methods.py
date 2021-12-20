@@ -28,6 +28,9 @@ class NoisyFlexMatchCrossEntropy(torch.nn.Module):
         self.register_buffer('ŷ', torch.tensor([num_classes] * num_samples))
         self.register_buffer('ỹ', torch.tensor(ỹ))
         self.register_buffer('T', torch.tensor(T))
+        ỹ_dist = self.ỹ.bincount()
+        ỹ_dist = ỹ_dist / ỹ_dist.sum()
+        self.register_buffer('ỹ_dist', ỹ_dist)
 
     def all_gather(self, x, world_size):
         x_list = [torch.zeros_like(x) for _ in range(world_size)]
@@ -37,11 +40,12 @@ class NoisyFlexMatchCrossEntropy(torch.nn.Module):
     def forward(self, logits_s, logits_w, ỹ, i):
         ỹŷ = torch.zeros((self.num_classes, self.num_classes + 1))
         ỹŷ.index_put_((self.ỹ, self.ŷ), torch.ones(self.num_samples), True)
-        ỹŷ = ỹŷ[:, :-1] + ỹŷ[:, -1].diag()
+        ỹŷ = ỹŷ[:, :-1] + ỹŷ[:, -1:] * self.ỹ_dist.to(ỹŷ.device)
         ỹŷ /= ỹŷ.sum(axis=0)
 
         probs = torch.softmax(logits_w / self.temperature, dim=-1)
         probs = probs * self.T[:, ỹ].t() / ỹŷ[ỹ].to(probs.device)
+        probs /= probs.sum(dim=-1, keepdim=True)
         max_probs, targets = probs.max(dim=-1)
 
         β = self.ŷ.bincount()
