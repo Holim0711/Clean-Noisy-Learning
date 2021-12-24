@@ -16,21 +16,19 @@ class AveragedModelWithBuffers(torch.optim.swa_utils.AveragedModel):
 
 
 class NoisyFlexMatchCrossEntropy(torch.nn.Module):
-    def __init__(self, num_classes, num_samples, ỹ, T,
-                 temperature, threshold, reduction='mean'):
+    def __init__(self, ỹ, T, temperature, threshold, reduction='mean'):
         super().__init__()
-        self.num_classes = num_classes
-        self.num_samples = num_samples
+        self.register_buffer('ỹ', torch.tensor(ỹ))
+        self.register_buffer('T', torch.tensor(T))
         self.threshold = threshold
         self.temperature = temperature
         self.reduction = reduction
+
+        self.num_samples = len(ỹ)
+        self.num_classes = len(T)
+        self.register_buffer('ỹ_dist', self.ỹ.bincount() / self.num_samples)
+        self.register_buffer('ŷ', torch.tensor([self.num_classes] * self.num_samples))
         self.𝜇ₘₐₛₖ = None
-        self.register_buffer('ŷ', torch.tensor([num_classes] * num_samples))
-        self.register_buffer('ỹ', torch.tensor(ỹ))
-        self.register_buffer('T', torch.tensor(T))
-        ỹ_dist = self.ỹ.bincount()
-        ỹ_dist = ỹ_dist / ỹ_dist.sum()
-        self.register_buffer('ỹ_dist', ỹ_dist)
 
     def all_gather(self, x, world_size):
         x_list = [torch.zeros_like(x) for _ in range(world_size)]
@@ -79,31 +77,18 @@ def change_bn(model, momentum):
             change_bn(children, momentum)
 
 
-def replace_relu(model):
-    for child_name, child in model.named_children():
-        if isinstance(child, torch.nn.ReLU):
-            setattr(model, child_name, torch.nn.LeakyReLU(0.1, inplace=True))
-        else:
-            replace_relu(child)
-
-
 class NoisyFlexMatchClassifier(pl.LightningModule):
 
-    def __init__(self, noisy_targets, transition_matrix, **kwargs):
+    def __init__(self, ỹ, T, **kwargs):
         super().__init__()
         for k in kwargs:
             self.save_hyperparameters(k)
 
         self.model = get_model(**self.hparams.model['backbone'])
         change_bn(self.model, self.hparams.model['momentum'])
-        replace_relu(self.model)
         self.criterionₗ = torch.nn.CrossEntropyLoss()
         self.criterionᵤ = NoisyFlexMatchCrossEntropy(
-            num_classes=self.hparams.model['backbone']['num_classes'],
-            num_samples=50000,
-            ỹ=noisy_targets,
-            T=transition_matrix,
-            **self.hparams.model['loss_u']
+            ỹ=ỹ, T=T, **self.hparams.model['loss_u']
         )
         self.train_acc = Accuracy()
         self.valid_acc = Accuracy()
