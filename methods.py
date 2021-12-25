@@ -111,43 +111,33 @@ class NoisyFlexMatchClassifier(pl.LightningModule):
         lossᵤ = self.criterionᵤ(ˢzᵤ, ʷzᵤ.detach(), ỹ, iᵤ)
         loss = lossₗ + lossᵤ
 
+        self.log('train/loss', loss)
+        self.log('train/loss_l', lossₗ)
+        self.log('train/loss_u', lossᵤ)
+        self.log('train/mask', self.criterionᵤ.𝜇ₘₐₛₖ)
         self.train_acc.update(zₗ.softmax(dim=1), yₗ)
-        return {'loss': loss,
-                'detail': {'loss_l': lossₗ.detach(),
-                           'loss_u': lossᵤ.detach(),
-                           'mask': self.criterionᵤ.𝜇ₘₐₛₖ}}
+        return loss
 
     def optimizer_step(self, *args, **kwargs):
         super().optimizer_step(*args, **kwargs)
         self.ema.update_parameters(self.model)
 
     def training_epoch_end(self, outputs):
-        loss = torch.stack([x['loss'] for x in outputs]).mean()
-        self.log('trn/loss', loss, sync_dist=True)
-        loss = torch.stack([x['detail']['mask'] for x in outputs]).mean()
-        self.log('detail/mask', loss, sync_dist=True)
-        loss = torch.stack([x['detail']['loss_l'] for x in outputs]).mean()
-        self.log('detail/loss_l', loss, sync_dist=True)
-        loss = torch.stack([x['detail']['loss_u'] for x in outputs]).mean()
-        self.log('detail/loss_u', loss, sync_dist=True)
-
         acc = self.train_acc.compute()
-        self.log('trn/acc', acc, rank_zero_only=True)
+        self.log('train/acc', acc)
         self.train_acc.reset()
 
     def validation_step(self, batch, batch_idx):
         x, y = batch
         z = self.ema(x)
         loss = self.criterionₗ(z, y)
+        self.log('val/loss', loss, on_step=False, on_epoch=True, sync_dist=True)
         self.valid_acc.update(z.softmax(dim=1), y)
-        return {'loss': loss}
+        return loss
 
     def validation_epoch_end(self, outputs):
-        loss = torch.stack([x['loss'] for x in outputs]).mean()
-        self.log('val/loss', loss, sync_dist=True)
-
         acc = self.valid_acc.compute()
-        self.log('val/acc', acc, rank_zero_only=True)
+        self.log('val/acc', acc)
         self.valid_acc.reset()
 
     def test_step(self, batch, batch_idx):
