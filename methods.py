@@ -1,3 +1,4 @@
+import math
 import torch
 import pytorch_lightning as pl
 from torchmetrics import Accuracy
@@ -16,12 +17,13 @@ class AveragedModelWithBuffers(torch.optim.swa_utils.AveragedModel):
 
 
 class NoisyFlexMatchCrossEntropy(torch.nn.Module):
-    def __init__(self, ỹ, T, temperature, threshold, reduction='mean'):
+    def __init__(self, ỹ, T, temperature, threshold, epsilon=0., reduction='mean'):
         super().__init__()
         self.register_buffer('ỹ', torch.tensor(ỹ))
         self.register_buffer('T', torch.tensor(T))
         self.threshold = threshold
         self.temperature = temperature
+        self.epsilon = epsilon
         self.reduction = reduction
 
         self.num_samples = len(ỹ)
@@ -42,7 +44,7 @@ class NoisyFlexMatchCrossEntropy(torch.nn.Module):
         ỹŷ /= ỹŷ.sum(axis=0)
 
         probs = torch.softmax(logits_w / self.temperature, dim=-1)
-        probs = probs * self.T[:, ỹ].t() / ỹŷ[ỹ].to(probs.device)
+        probs = probs * self.T[:, ỹ].t() / (ỹŷ[ỹ].to(probs.device) + self.epsilon)
         probs /= probs.sum(dim=-1, keepdim=True)
         max_probs, targets = probs.max(dim=-1)
 
@@ -83,19 +85,19 @@ class NoisyFlexMatchClassifier(pl.LightningModule):
         super().__init__()
         for k in kwargs:
             self.save_hyperparameters(k)
+        self.steps_per_epoch = math.ceil(len(ỹ) / self.hparams.dataset['batch_sizes']['noisy'])
 
         self.model = get_model(**self.hparams.model['backbone'])
-        change_bn(self.model, self.hparams.model['momentum'])
         self.criterionₗ = torch.nn.CrossEntropyLoss()
-        self.criterionᵤ = NoisyFlexMatchCrossEntropy(
-            ỹ=ỹ, T=T, **self.hparams.model['loss_u']
-        )
+        self.criterionᵤ = NoisyFlexMatchCrossEntropy(ỹ, T, **self.hparams.model['loss_u'])
         self.train_acc = Accuracy()
         self.valid_acc = Accuracy()
 
+        change_bn(self.model, self.hparams.model['momentum'])
+
         def avg_fn(averaged_model_parameter, model_parameter, num_averaged):
-            α = self.hparams.model['momentum']
-            return α * averaged_model_parameter + (1 - α) * model_parameter
+            m = self.hparams.model['momentum']
+            return m * averaged_model_parameter + (1 - m) * model_parameter
         self.ema = AveragedModelWithBuffers(self.model, avg_fn=avg_fn)
 
     def training_step(self, batch, batch_idx):
@@ -145,17 +147,6 @@ class NoisyFlexMatchClassifier(pl.LightningModule):
 
     def test_epoch_end(self, outputs):
         return self.validation_epoch_end(outputs)
-
-    @property
-    def num_devices(self) -> int:
-        t = self.trainer
-        return t.num_nodes * max(t.num_processes, t.num_gpus, t.tpu_cores or 0)
-
-    @property
-    def steps_per_epoch(self) -> int:
-        num_iter = len(self.train_dataloader()['noisy'])
-        num_accum = self.trainer.accumulate_grad_batches
-        return num_iter // (num_accum * self.num_devices)
 
     def configure_optimizers(self):
         params = exclude_wd(self.model)
