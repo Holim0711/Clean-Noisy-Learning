@@ -100,7 +100,7 @@ class NoisyFlexMatchClassifier(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         xₗ, yₗ = batch['clean']
-        iᵤ, ((ˢxᵤ, ʷxᵤ), (ỹ, _)) = batch['noisy']
+        iᵤ, ((ˢxᵤ, ʷxᵤ), ỹ) = batch['noisy']
 
         z = self.model(torch.cat((xₗ, ˢxᵤ, ʷxᵤ)))
         zₗ = z[:xₗ.shape[0]]

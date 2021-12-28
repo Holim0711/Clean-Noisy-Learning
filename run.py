@@ -59,12 +59,12 @@ def train(config, args):
             'val': config['dataset']['batch_sizes']['val'],
         },
         random_seed=args.random_seed,
-        show_sample_indices=True,
+        enum_unproved=True,
     )
     dm.prepare_data()
     dm.setup()
 
-    ỹ = [x[0] for x in dm.datasets['noisy'].dataset.targets]
+    ỹ = dm.datasets['noisy'].dataset.targets
     T = dm.T if args.T is None else torch.load(args.T)
 
     model = NoisyFlexMatchClassifier(ỹ, T, **config)
@@ -82,7 +82,7 @@ def test(config, args):
     )
     dm.prepare_data()
     dm.setup()
-    ỹ = [x[0] for x in dm.datasets['noisy'].targets]
+    ỹ = dm.datasets['noisy'].targets
     T = dm.T
     model = NoisyFlexMatchClassifier.load_from_checkpoint(args.ckpt_path, ỹ=ỹ, T=T)
     trainer.test(model, dm.test_dataloader())
