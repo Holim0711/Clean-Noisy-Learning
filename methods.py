@@ -48,9 +48,10 @@ class NoisyFlexMatchCrossEntropy(torch.nn.Module):
         probs /= probs.sum(dim=-1, keepdim=True)
         max_probs, targets = probs.max(dim=-1)
 
-        β = self.ŷ.bincount()
+        β = self.ŷ.cpu().bincount()
         β = β / β.max()
         β = β / (2 - β)
+        β = β.to(max_probs.device)
         masks = max_probs > self.threshold * β[targets]
 
         ŷ = torch.where(max_probs > self.threshold, targets, -1)
