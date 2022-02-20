@@ -133,3 +133,4 @@ dmypy.json
 lightning_logs/
 logs/
 data/
+.history
