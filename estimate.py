@@ -102,7 +102,6 @@ class NoiseEstimator(pl.LightningModule):
                 return α * averaged_model_parameter + (1 - α) * model_parameter
             self.ema = AveragedModelWithBuffers(self.model, avg_fn=avg_fn)
 
-        self.avg_conf = None
         self.best_err = 1.0
         self.is_best_err = False
 
@@ -167,44 +166,106 @@ class NoiseEstimator(pl.LightningModule):
 
     def test_epoch_end(self, outputs):
         C = self.hparams.model['backbone']['num_classes']
+        E = self.current_epoch
+        real = torch.concat([x['real'].cpu() for x in outputs])
+        pred = torch.concat([x['pred'].cpu() for x in outputs])
+        conf = pred.max(dim=1).values
+        info = -pred.xlogy(pred).sum(dim=1)
 
-        if self.avg_conf is None:
-            self.avg_conf = [ỹ.max() for x in outputs for ỹ in x['pred'].cpu()]
+        if E == 0:
+            self.avg_conf = conf
         else:
-            conf = [ỹ.max() for x in outputs for ỹ in x['pred'].cpu()]
-            self.avg_conf = [
-                (c1 * self.current_epoch + c2) / (self.current_epoch + 1)
-                for c1, c2 in zip(self.avg_conf, conf)
-            ]
+            self.avg_conf = (self.avg_conf * E + conf) / (E + 1)
 
+        if E == 0:
+            self.avg_info = info
+        else:
+            self.avg_info = (self.avg_info * E + info) / (E + 1)
+
+        # just average
+        T1 = torch.zeros((C, C))
+        for y, ỹ in zip(real, pred):
+            T1[y] += ỹ
+        T1 /= T1.sum(axis=1, keepdim=True)
+
+        # max confidence
+        T2 = torch.zeros((C, C))
         max_conf = torch.zeros(C)
-        T_one = torch.zeros((C, C))
-        for x in outputs:
-            for y, ỹ, c in zip(x['real'].cpu(), x['pred'].cpu(), self.avg_conf):
-                if max_conf[y] < c:
-                    max_conf[y] = c
-                    T_one[y] = ỹ
+        for y, ỹ, c in zip(real, pred, conf):
+            if max_conf[y] < c:
+                max_conf[y] = c
+                T2[y] = ỹ
 
-        T_avg = torch.zeros((C, C))
-        for x in outputs:
-            for y, ỹ in zip(x['real'].cpu(), x['pred'].cpu()):
-                T_avg[y] += ỹ
-        T_avg /= T_avg.sum(axis=1, keepdim=True)
+        # min entropy
+        T3 = torch.zeros((C, C))
+        min_info = torch.ones(C) * torch.tensor(C).log()
+        for y, ỹ, h in zip(real, pred, info):
+            if min_info[y] > h:
+                min_info[y] = h
+                T3[y] = ỹ
+
+        # max average confidence
+        T4 = torch.zeros((C, C))
+        max_avg_conf = torch.zeros(C)
+        for y, ỹ, c in zip(real, pred, self.avg_conf):
+            if max_avg_conf[y] < c:
+                max_avg_conf[y] = c
+                T4[y] = ỹ
+
+        # min average entropy
+        T5 = torch.zeros((C, C))
+        min_avg_info = torch.ones(C) * torch.tensor(C).log()
+        for y, ỹ, h in zip(real, pred, self.avg_info):
+            if min_avg_info[y] > h:
+                min_avg_info[y] = h
+                T5[y] = ỹ
+
+        # average weighted by average confidence
+        T6 = torch.zeros((C, C))
+        for y, ỹ, c in zip(real, pred, self.avg_conf):
+            T6[y] += ỹ * c
+        T6 /= T6.sum(axis=1, keepdim=True)
+
+        # average weighted by e^(-average entropy)
+        T7 = torch.zeros((C, C))
+        for y, ỹ, h in zip(real, pred, self.avg_info):
+            T7[y] += ỹ * (-h).exp()
+        T7 /= T7.sum(axis=1, keepdim=True)
 
         self.logger.experiment.add_figure(
-            'T_one', plot_confusion_matrix(T_one), self.current_epoch)
+            'T1', plot_confusion_matrix(T1), self.current_epoch)
         self.logger.experiment.add_figure(
-            'T_avg', plot_confusion_matrix(T_avg), self.current_epoch)
+            'T2', plot_confusion_matrix(T2), self.current_epoch)
+        self.logger.experiment.add_figure(
+            'T3', plot_confusion_matrix(T3), self.current_epoch)
+        self.logger.experiment.add_figure(
+            'T4', plot_confusion_matrix(T4), self.current_epoch)
+        self.logger.experiment.add_figure(
+            'T5', plot_confusion_matrix(T5), self.current_epoch)
+        self.logger.experiment.add_figure(
+            'T6', plot_confusion_matrix(T6), self.current_epoch)
+        self.logger.experiment.add_figure(
+            'T7', plot_confusion_matrix(T7), self.current_epoch)
 
         if self.is_best_err:
             save_path = os.path.join(self.logger.log_dir, 'T')
             if not os.path.isdir(save_path):
                 os.makedirs(save_path)
-            torch.save(T_one, os.path.join(save_path, f'one.pth'))
-            torch.save(T_avg, os.path.join(save_path, f'avg.pth'))
+            torch.save(T1, os.path.join(save_path, f'T1.pth'))
+            torch.save(T2, os.path.join(save_path, f'T2.pth'))
+            torch.save(T3, os.path.join(save_path, f'T3.pth'))
+            torch.save(T4, os.path.join(save_path, f'T4.pth'))
+            torch.save(T5, os.path.join(save_path, f'T5.pth'))
+            torch.save(T6, os.path.join(save_path, f'T6.pth'))
+            torch.save(T6, os.path.join(save_path, f'T7.pth'))
 
-        self.log('val/rmse/T_one', ((self.real_T - T_one) ** 2).mean().sqrt())
-        self.log('val/rmse/T_avg', ((self.real_T - T_avg) ** 2).mean().sqrt())
+        self.log('val/rmse/T1', ((self.real_T - T1) ** 2).mean().sqrt())
+        self.log('val/rmse/T2', ((self.real_T - T2) ** 2).mean().sqrt())
+        self.log('val/rmse/T3', ((self.real_T - T3) ** 2).mean().sqrt())
+        self.log('val/rmse/T4', ((self.real_T - T4) ** 2).mean().sqrt())
+        self.log('val/rmse/T5', ((self.real_T - T5) ** 2).mean().sqrt())
+        self.log('val/rmse/T6', ((self.real_T - T6) ** 2).mean().sqrt())
+        self.log('val/rmse/T7', ((self.real_T - T7) ** 2).mean().sqrt())
 
     def configure_optimizers(self):
         optim = get_optim(self, **self.hparams.optimizer)
