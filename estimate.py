@@ -96,10 +96,20 @@ class NoiseEstimator(pl.LightningModule):
         self.criterion = nn.CrossEntropyLoss()
         self.accuracy = nn.ModuleDict({k: Accuracy() for k in ['trn', 'val']})
 
-        def avg_fn(averaged_model_parameter, model_parameter, num_averaged):
-            α = self.hparams.model['momentum']
-            return α * averaged_model_parameter + (1 - α) * model_parameter
-        self.ema = AveragedModelWithBuffers(self.model, avg_fn=avg_fn)
+        if self.hparams.model['ema']:
+            def avg_fn(averaged_model_parameter, model_parameter, _):
+                α = self.hparams.model['momentum']
+                return α * averaged_model_parameter + (1 - α) * model_parameter
+            self.ema = AveragedModelWithBuffers(self.model, avg_fn=avg_fn)
+
+        self.avg_conf = None
+        self.best_err = 1.0
+        self.is_best_err = False
+
+        self.real_T = torch.tensor(transition_matrix(
+            self.hparams.model['backbone']['num_classes'],
+            self.hparams['dataset']['noise_type'],
+            self.hparams['dataset']['noise_ratio']))
 
     @property
     def phase_name(self):
@@ -107,10 +117,11 @@ class NoiseEstimator(pl.LightningModule):
 
     def optimizer_step(self, *args, **kwargs):
         super().optimizer_step(*args, **kwargs)
-        self.ema.update_parameters(self.model)
+        if self.hparams.model['ema']:
+            self.ema.update_parameters(self.model)
 
     def forward(self, x):
-        if self.training:
+        if self.training or not self.hparams.model['ema']:
             return self.model(x)
         else:
             return self.ema(x)
@@ -125,8 +136,10 @@ class NoiseEstimator(pl.LightningModule):
 
     def shared_epoch_end(self, outputs):
         phase = self.phase_name
-        self.log(f'{phase}/err', 1 - self.accuracy[phase].compute())
+        err = 1 - self.accuracy[phase].compute()
+        self.log(f'{phase}/err', err)
         self.accuracy[phase].reset()
+        return err
 
     def training_step(self, batch, batch_idx):
         return self.shared_step(batch)
@@ -141,36 +154,57 @@ class NoiseEstimator(pl.LightningModule):
             return self.test_step(batch, batch_idx)
 
     def validation_epoch_end(self, outputs):
-        self.shared_epoch_end(outputs[0])
+        err = self.shared_epoch_end(outputs[0])
+        self.is_best_err = (err < self.best_err)
+        if self.is_best_err:
+            self.best_err = err
         self.test_epoch_end(outputs[1])
 
     def test_step(self, batch, batch_idx):
         x, y = batch
-        ỹ = self.ema(x).softmax(dim=-1)
+        ỹ = self(x).softmax(dim=-1)
         return {'real': y, 'pred': ỹ}
 
     def test_epoch_end(self, outputs):
         C = self.hparams.model['backbone']['num_classes']
-        max_conf = torch.zeros(C)
-        pred_T = torch.zeros((C, C))
 
+        if self.avg_conf is None:
+            self.avg_conf = [ỹ.max() for x in outputs for ỹ in x['pred'].cpu()]
+        else:
+            conf = [ỹ.max() for x in outputs for ỹ in x['pred'].cpu()]
+            self.avg_conf = [
+                (c1 * self.current_epoch + c2) / (self.current_epoch + 1)
+                for c1, c2 in zip(self.avg_conf, conf)
+            ]
+
+        max_conf = torch.zeros(C)
+        T_one = torch.zeros((C, C))
+        for x in outputs:
+            for y, ỹ, c in zip(x['real'].cpu(), x['pred'].cpu(), self.avg_conf):
+                if max_conf[y] < c:
+                    max_conf[y] = c
+                    T_one[y] = ỹ
+
+        T_avg = torch.zeros((C, C))
         for x in outputs:
             for y, ỹ in zip(x['real'].cpu(), x['pred'].cpu()):
-                if max_conf[y] < ỹ.max():
-                    max_conf[y] = ỹ.max()
-                    pred_T[y] = ỹ
+                T_avg[y] += ỹ
+        T_avg /= T_avg.sum(axis=1, keepdim=True)
 
-        torch.save(pred_T, os.path.join(self.logger.log_dir, 'T.pth'))
-        fig = plot_confusion_matrix(pred_T)
-        self.logger.experiment.add_figure('matrix', fig, self.current_epoch)
+        self.logger.experiment.add_figure(
+            'T_one', plot_confusion_matrix(T_one), self.current_epoch)
+        self.logger.experiment.add_figure(
+            'T_avg', plot_confusion_matrix(T_avg), self.current_epoch)
 
-        real_T = torch.tensor(transition_matrix(
-            self.hparams.model['backbone']['num_classes'],
-            self.hparams['dataset']['noise_type'],
-            self.hparams['dataset']['noise_ratio']))
+        if self.is_best_err:
+            save_path = os.path.join(self.logger.log_dir, 'T')
+            if not os.path.isdir(save_path):
+                os.makedirs(save_path)
+            torch.save(T_one, os.path.join(save_path, f'one.pth'))
+            torch.save(T_avg, os.path.join(save_path, f'avg.pth'))
 
-        err = real_T - pred_T
-        self.log('val/rmse', (err * err).mean().sqrt())
+        self.log('val/rmse/T_one', ((self.real_T - T_one) ** 2).mean().sqrt())
+        self.log('val/rmse/T_avg', ((self.real_T - T_avg) ** 2).mean().sqrt())
 
     def configure_optimizers(self):
         optim = get_optim(self, **self.hparams.optimizer)
@@ -189,9 +223,24 @@ def train(dm, hparams, args):
     dm.prepare_data()
     dm.setup()
 
-    train_loader = dm.dataloader('noisy')
-    val_loader = dm.val_dataloader()
-    test_loader = DataLoader(
+    noisy_data = dm.datasets['noisy']
+    noisy_train, noisy_val = torch.utils.data.random_split(
+        noisy_data,
+        [len(noisy_data) - len(noisy_data) // 10, len(noisy_data) // 10])
+    train_loader = DataLoader(
+        noisy_train,
+        batch_size=hparams['dataset']['batch_sizes']['train'],
+        shuffle=True,
+        num_workers=os.cpu_count(),
+        pin_memory=True
+    )
+    val_loader = DataLoader(
+        noisy_val,
+        batch_size=hparams['dataset']['batch_sizes']['val'],
+        num_workers=os.cpu_count(),
+        pin_memory=True
+    )
+    clean_loader = DataLoader(
         dm.datasets['clean'].datasets[0],
         batch_size=hparams['dataset']['batch_sizes']['val'],
         num_workers=os.cpu_count(), pin_memory=True)
@@ -202,14 +251,14 @@ def train(dm, hparams, args):
             f"lightning_logs/matrix/{hparams['dataset']['name']}",
             f"{args.num_clean}-{args.noise_type}-{args.noise_ratio}-{args.random_seed}"),
         callbacks=[
-            ModelCheckpoint(save_last=True),
+            ModelCheckpoint(monitor='val/err', save_top_k=1, save_last=True),
             LearningRateMonitor(),
         ]
     )
 
     pl_module = NoiseEstimator(**hparams, steps_per_epoch=len(train_loader))
 
-    trainer.fit(pl_module, train_loader, [val_loader, test_loader])
+    trainer.fit(pl_module, train_loader, [val_loader, clean_loader])
 
 
 if __name__ == "__main__":

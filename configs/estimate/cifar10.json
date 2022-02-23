@@ -19,7 +19,8 @@
             "name": "wide_resnet28_2",
             "num_classes": 10    
         },
-        "momentum": 0.99
+        "momentum": 0.99,
+        "ema": true
     },
     "dataset": {
         "name": "cifar10",
