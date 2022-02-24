@@ -232,20 +232,27 @@ class NoiseEstimator(pl.LightningModule):
             T7[y] += ỹ * (-h).exp()
         T7 /= T7.sum(axis=1, keepdim=True)
 
-        self.logger.experiment.add_figure(
-            'T1', plot_confusion_matrix(T1), self.current_epoch)
-        self.logger.experiment.add_figure(
-            'T2', plot_confusion_matrix(T2), self.current_epoch)
-        self.logger.experiment.add_figure(
-            'T3', plot_confusion_matrix(T3), self.current_epoch)
-        self.logger.experiment.add_figure(
-            'T4', plot_confusion_matrix(T4), self.current_epoch)
-        self.logger.experiment.add_figure(
-            'T5', plot_confusion_matrix(T5), self.current_epoch)
-        self.logger.experiment.add_figure(
-            'T6', plot_confusion_matrix(T6), self.current_epoch)
-        self.logger.experiment.add_figure(
-            'T7', plot_confusion_matrix(T7), self.current_epoch)
+        self.logger.experiment.add_image('T1', T1, self.current_epoch, dataformats='HW')
+        self.logger.experiment.add_image('T2', T2, self.current_epoch, dataformats='HW')
+        self.logger.experiment.add_image('T3', T3, self.current_epoch, dataformats='HW')
+        self.logger.experiment.add_image('T4', T4, self.current_epoch, dataformats='HW')
+        self.logger.experiment.add_image('T5', T5, self.current_epoch, dataformats='HW')
+        self.logger.experiment.add_image('T6', T6, self.current_epoch, dataformats='HW')
+        self.logger.experiment.add_image('T7', T7, self.current_epoch, dataformats='HW')
+        # self.logger.experiment.add_figure(
+        #     'T1', plot_confusion_matrix(T1), self.current_epoch)
+        # self.logger.experiment.add_figure(
+        #     'T2', plot_confusion_matrix(T2), self.current_epoch)
+        # self.logger.experiment.add_figure(
+        #     'T3', plot_confusion_matrix(T3), self.current_epoch)
+        # self.logger.experiment.add_figure(
+        #     'T4', plot_confusion_matrix(T4), self.current_epoch)
+        # self.logger.experiment.add_figure(
+        #     'T5', plot_confusion_matrix(T5), self.current_epoch)
+        # self.logger.experiment.add_figure(
+        #     'T6', plot_confusion_matrix(T6), self.current_epoch)
+        # self.logger.experiment.add_figure(
+        #     'T7', plot_confusion_matrix(T7), self.current_epoch)
 
         if self.is_best_err:
             save_path = os.path.join(self.logger.log_dir, 'T')
