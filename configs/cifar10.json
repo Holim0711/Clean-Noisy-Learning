@@ -21,7 +21,7 @@
     },
     "model": {
         "backbone": {
-            "src": "weaver",
+            "src": "torchssl",
             "name": "wide_resnet28_2",
             "negative_slope": 0.1,
             "num_classes": 10
