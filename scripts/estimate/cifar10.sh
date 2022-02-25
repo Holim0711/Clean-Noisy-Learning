@@ -1,0 +1,12 @@
+python estimate.py configs/estimate/cifar10.json --gpus=1 --max_epochs 300 --noise_ratio 0.2 --deterministic --random_seed 0
+python estimate.py configs/estimate/cifar10.json --gpus=1 --max_epochs 300 --noise_ratio 0.2 --deterministic --random_seed 1
+python estimate.py configs/estimate/cifar10.json --gpus=1 --max_epochs 300 --noise_ratio 0.2 --deterministic --random_seed 2
+python estimate.py configs/estimate/cifar10.json --gpus=1 --max_epochs 300 --noise_ratio 0.8 --deterministic --random_seed 0
+python estimate.py configs/estimate/cifar10.json --gpus=1 --max_epochs 300 --noise_ratio 0.8 --deterministic --random_seed 1
+python estimate.py configs/estimate/cifar10.json --gpus=1 --max_epochs 300 --noise_ratio 0.8 --deterministic --random_seed 2
+python estimate.py configs/estimate/cifar10.json --gpus=1 --max_epochs 300 --noise_type asymmetric --noise_ratio 0.2 --deterministic --random_seed 0
+python estimate.py configs/estimate/cifar10.json --gpus=1 --max_epochs 300 --noise_type asymmetric --noise_ratio 0.2 --deterministic --random_seed 1
+python estimate.py configs/estimate/cifar10.json --gpus=1 --max_epochs 300 --noise_type asymmetric --noise_ratio 0.2 --deterministic --random_seed 2
+python estimate.py configs/estimate/cifar10.json --gpus=1 --max_epochs 300 --noise_type asymmetric --noise_ratio 0.8 --deterministic --random_seed 0
+python estimate.py configs/estimate/cifar10.json --gpus=1 --max_epochs 300 --noise_type asymmetric --noise_ratio 0.8 --deterministic --random_seed 1
+python estimate.py configs/estimate/cifar10.json --gpus=1 --max_epochs 300 --noise_type asymmetric --noise_ratio 0.8 --deterministic --random_seed 2
