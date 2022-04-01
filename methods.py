@@ -5,6 +5,7 @@ from torchmetrics import Accuracy
 from weaver.models import get_model
 from weaver.optimizers import get_optim, exclude_wd
 from weaver.schedulers import get_sched
+from utils import plot_confusion_matrix
 
 __all__ = ['NoisyFlexMatchClassifier']
 
@@ -17,20 +18,28 @@ class AveragedModelWithBuffers(torch.optim.swa_utils.AveragedModel):
 
 
 class NoisyFlexMatchCrossEntropy(torch.nn.Module):
-    def __init__(self, ỹ, T, temperature, threshold, epsilon=0., reduction='mean'):
+    def __init__(self, ỹ, T, threshold, temperature, reduction='mean'):
         super().__init__()
-        self.register_buffer('ỹ', torch.tensor(ỹ))
-        self.register_buffer('T', torch.tensor(T))
+
+        if not isinstance(ỹ, torch.Tensor):
+            ỹ = torch.tensor(ỹ)
+        if not isinstance(T, torch.Tensor):
+            T = torch.tensor(T)
+
+        self.C = len(ỹ.unique())                    # |C|
+        self.D = len(ỹ)                             # |D|
+        self.ŷ = torch.tensor([self.C] * self.D)    # All ŷₖ = ∅ at first
+        self.ỹ = ỹ
+        self.T = T                                  # P(ỹ|y)
+        self.Pỹ = ỹ.bincount() / len(ỹ)             # P(ỹ)
+
         self.threshold = threshold
         self.temperature = temperature
-        self.epsilon = epsilon
         self.reduction = reduction
 
-        self.num_samples = len(ỹ)
-        self.num_classes = len(T)
-        self.register_buffer('ỹ_dist', self.ỹ.bincount() / self.num_samples)
-        self.register_buffer('ŷ', torch.tensor([self.num_classes] * self.num_samples))
-        self.𝜇ₘₐₛₖ = None
+        # Monitoring Variables
+        self.𝜇 = None
+        self.M = None
 
     def all_gather(self, x, world_size):
         x_list = [torch.zeros_like(x) for _ in range(world_size)]
@@ -38,13 +47,14 @@ class NoisyFlexMatchCrossEntropy(torch.nn.Module):
         return torch.hstack(x_list)
 
     def forward(self, logits_s, logits_w, ỹ, i):
-        ỹŷ = torch.zeros((self.num_classes, self.num_classes + 1))
-        ỹŷ.index_put_((self.ỹ, self.ŷ), torch.ones(self.num_samples), True)
-        ỹŷ = ỹŷ[:, :-1] + ỹŷ[:, -1:] * self.ỹ_dist.to(ỹŷ.device)
-        ỹŷ /= ỹŷ.sum(axis=0)
+        M = torch.zeros((self.C + 1, self.C), dtype=torch.long)
+        M.index_put_((self.ŷ, self.ỹ), torch.tensor(1), True)
+        M = M[:-1] + (M[-1] + self.Pỹ) * self.Pỹ
+        M = M / M.sum(axis=1)
+        α = (self.T / M).to(logits_w.device)
 
         probs = torch.softmax(logits_w / self.temperature, dim=-1)
-        probs = probs * self.T[:, ỹ].t() / (ỹŷ[ỹ].to(probs.device) + self.epsilon)
+        probs *= α[:, ỹ].t()
         probs /= probs.sum(dim=-1, keepdim=True)
         max_probs, targets = probs.max(dim=-1)
 
@@ -59,11 +69,16 @@ class NoisyFlexMatchCrossEntropy(torch.nn.Module):
             world_size = torch.distributed.get_world_size()
             ŷ = self.all_gather(ŷ, world_size)
             i = self.all_gather(i, world_size)
-        self.ŷ[i[ŷ != -1]] = ŷ[ŷ != -1]
+        i = i[ŷ != -1].cpu()
+        ŷ = ŷ[ŷ != -1].cpu()
+        self.ŷ[i] = ŷ
 
         loss = torch.nn.functional.cross_entropy(
             logits_s, targets, reduction='none') * masks
-        self.𝜇ₘₐₛₖ = masks.float().mean().detach()
+
+        # Monitoring Variables
+        self.𝜇 = masks.float().mean().item()
+        self.M = M
 
         if self.reduction == 'mean':
             return loss.mean()
@@ -117,7 +132,7 @@ class NoisyFlexMatchClassifier(pl.LightningModule):
         self.log('train/loss', loss)
         self.log('train/loss_l', lossₗ)
         self.log('train/loss_u', lossᵤ)
-        self.log('train/mask', self.criterionᵤ.𝜇ₘₐₛₖ)
+        self.log('train/mask', self.criterionᵤ.𝜇)
         self.train_acc.update(zₗ.softmax(dim=1), yₗ)
         return loss
 
@@ -129,6 +144,24 @@ class NoisyFlexMatchClassifier(pl.LightningModule):
         acc = self.train_acc.compute()
         self.log('train/acc', acc)
         self.train_acc.reset()
+
+        logger = self.logger.experiment
+
+        # logging T
+        if self.current_epoch == 0:
+            if len(self.criterionᵤ.T) <= 20:
+                fig = plot_confusion_matrix(self.criterionᵤ.T)
+                logger.add_figure('T', fig, 0)
+            else:
+                logger.add_image('T', self.criterionᵤ.T, 0, dataformats='HW')
+
+        # logging M
+        if len(self.criterionᵤ.T) <= 20:
+            fig = plot_confusion_matrix(self.criterionᵤ.M)
+            logger.add_figure('M', fig, self.current_epoch)
+        else:
+            logger.add_image('M', self.criterionᵤ.M, self.current_epoch,
+                             dataformats='HW')
 
     def validation_step(self, batch, batch_idx):
         x, y = batch
