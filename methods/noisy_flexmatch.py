@@ -25,20 +25,24 @@ class NoisyFlexMatchCrossEntropy(torch.nn.Module):
         self.Ỹ = torch.tensor(Ỹ)
         self.Ŷ = torch.tensor([self.num_classes] * self.num_samples)
 
-        self.Dỹ = self.Ỹ.bincount() / self.num_samples
+        self.ones = torch.ones(self.num_samples)
+        # self.Dỹ = self.Ỹ.bincount().view(-1, 1) / self.num_samples
 
     def forward(self, logits_s, logits_w, ỹ):
-        ỹŷ = torch.zeros((self.num_classes, self.num_classes + 1))
-        ỹŷ.index_put_((self.ỹ, self.ŷ), torch.ones(self.num_samples), True)
-        ỹŷ = ỹŷ[:, :-1] + ỹŷ[:, -1:] * self.ỹ_dist.to(ỹŷ.device)
-        ỹŷ /= ỹŷ.sum(axis=0)
+        Tŷỹ = torch.zeros((self.num_classes + 1, self.num_classes))
+        Tŷỹ.index_put_((self.Ŷ, self.Ỹ), self.ones, True)
+        Tŷỹ = Tŷỹ[:-1] + 1  # try?: (self.Dỹ * Tŷỹ[-1])
+        Tŷỹ = Tŷỹ / Tŷỹ.sum(axis=1, keepdims=True)
+
+        α = self.T / Tŷỹ
+        α = α.t().to(ỹ.device)
 
         probs = torch.softmax(logits_w / self.temperature, dim=-1)
-        probs = probs * self.T[:, ỹ].t() / ỹŷ[ỹ].to(probs.device)
+        probs *= α[ỹ]
         probs /= probs.sum(dim=-1, keepdim=True)
         max_probs, targets = probs.max(dim=-1)
 
-        β = self.Ŷ.cpu().bincount()
+        β = self.Ŷ.bincount()
         β = β / β.max()
         β = β / (2 - β)
         β = β.to(targets.device)
@@ -162,5 +166,4 @@ class NoisyFlexMatchClassifier(pl.LightningModule):
         params = exclude_wd(self.model)
         optim = get_optim(params, **self.hparams.optimizer)
         sched = get_sched(optim, **self.hparams.scheduler)
-        sched.extend(self.steps_per_epoch)
         return {'optimizer': optim, 'lr_scheduler': {'scheduler': sched}}
