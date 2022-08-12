@@ -18,9 +18,7 @@
             "src": "weaver",
             "name": "preact_resnet18",
             "num_classes": 10    
-        },
-        "momentum": 0.99,
-        "ema": true
+        }
     },
     "dataset": {
         "name": "CIFAR10",
