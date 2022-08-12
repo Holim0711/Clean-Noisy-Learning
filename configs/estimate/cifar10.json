@@ -1,5 +1,5 @@
 {
-    "transforms": {
+    "transform": {
         "train": [
             {"name": "RandAugment", "n": 3, "m": 5, "fillcolor": "CIFAR10"},
             {"name": "Cutout", "ratio": 0.5, "fillcolor": "CIFAR10"},
