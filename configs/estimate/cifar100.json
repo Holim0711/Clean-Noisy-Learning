@@ -46,6 +46,6 @@
             {"name": "LinearLR", "start_factor": 0.2, "total_iters": 5},
             {"name": "CosineAnnealingLR", "T_max": 295}
         ],
-        "milestones": [4]
+        "milestones": [5]
     }
 }
