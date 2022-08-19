@@ -1,3 +1,5 @@
+import os
+import numpy as np
 import torch
 import pytorch_lightning as pl
 from torchmetrics import Accuracy
@@ -11,21 +13,21 @@ __all__ = ['NoisyFlexMatchClassifier']
 
 
 class NoisyFlexMatchCrossEntropy(torch.nn.Module):
-    def __init__(self, Ỹ, T, temperature, threshold, reduction='mean'):
+
+    def __init__(self, num_classes, num_samples, temperature, threshold):
         super().__init__()
         self.threshold = threshold
         self.temperature = temperature
-        self.reduction = reduction
         self.𝜇ₘₐₛₖ = None
 
-        self.num_classes = len(T)
-        self.num_samples = len(Ỹ)
+        self.num_classes = num_classes
+        self.num_samples = num_samples
 
-        self.T = torch.tensor(T)
-        self.Ỹ = torch.tensor(Ỹ)
-        self.Ŷ = torch.tensor([self.num_classes] * self.num_samples)
+        self.T = torch.eye(num_classes)
+        self.Ỹ = torch.tensor([num_classes] * num_samples)
+        self.Ŷ = torch.tensor([num_classes] * num_samples)
 
-        self.ones = torch.ones(self.num_samples)
+        self.ones = torch.ones(num_samples)
         # self.Dỹ = self.Ỹ.bincount().view(-1, 1) / self.num_samples
 
     def forward(self, logits_s, logits_w, ỹ):
@@ -54,33 +56,42 @@ class NoisyFlexMatchCrossEntropy(torch.nn.Module):
             logits_s, targets, reduction='none') * masks
         self.𝜇ₘₐₛₖ = masks.float().mean().detach()
 
-        if self.reduction == 'mean':
-            return loss.mean()
-        elif self.reduction == 'sum':
-            return loss.sum()
-        return loss
+        return loss.mean()
 
 
 class NoisyFlexMatchClassifier(pl.LightningModule):
 
-    def __init__(self, Ỹ, T, **kwargs):
+    def __init__(self, **kwargs):
         super().__init__()
-        for k in kwargs:
-            self.save_hyperparameters(k)
+        self.save_hyperparameters()
 
         self.model = get_classifier(**self.hparams.model['backbone'])
         if a := self.hparams.model.get('lrelu'):
             replace_relu_to_lrelu(self.model, a)
         self.criterionₗ = torch.nn.CrossEntropyLoss()
         self.criterionᵤ = NoisyFlexMatchCrossEntropy(
-            Ỹ, T, **self.hparams.model['loss_u'])
+            self.hparams.model['backbone']['num_classes'],
+            {
+                'CIFAR10': 50000,
+                'CIFAR100': 50000,
+            }[self.hparams.dataset['name']],
+            **self.hparams.model['loss_u']
+        )
         self.train_acc = Accuracy()
-        self.valid_acc = Accuracy()
+        self.val_acc = Accuracy()
 
         if m := self.hparams.model.get('ema'):
             change_bn_momentum(self.model, m)
             self.ema = EMA(self.model, m)
             self.val_acc_ema = Accuracy()
+
+    def on_train_start(self):
+        self.criterionᵤ.T = torch.load(self.hparams.T)
+        self.criterionᵤ.Ỹ = torch.from_numpy(np.load(os.path.join(
+            'data', self.hparams.dataset['name'], 'noisy') +
+            f"-{self.hparams.dataset['noise_type']}" +
+            f"-{self.hparams.dataset['noise_ratio']}" +
+            f"-{self.hparams.dataset['random_seed']}.npy"))
 
     def training_step(self, batch, batch_idx):
         xₗ, yₗ = batch['clean']

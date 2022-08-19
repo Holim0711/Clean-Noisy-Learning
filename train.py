@@ -10,7 +10,7 @@ from pytorch_lightning.utilities.seed import seed_everything
 
 from weaver.transforms import get_xform
 from weaver.transforms.twin_transforms import NqTwinTransform
-from synthetic_noisy_datasets import NoisyCIFAR10, NoisyCIFAR100
+from synthetic_noisy_datasets.datamodules import NoisyCIFAR10, NoisyCIFAR100
 
 from methods import NoisyFlexMatchClassifier
 
@@ -35,8 +35,8 @@ def train(args):
     transform_v = get_xform('Compose', transforms=config['transform']['val'])
 
     Dataset = {
-        'cifar10': NoisyCIFAR10,
-        'cifar100': NoisyCIFAR100,
+        'CIFAR10': NoisyCIFAR10,
+        'CIFAR100': NoisyCIFAR100,
     }[config['dataset']['name']]
 
     dm = Dataset(
@@ -55,16 +55,13 @@ def train(args):
             'val': config['dataset']['batch_sizes']['val'],
         },
         random_seed=config['dataset']['random_seed'],
-        enum_noisy=True,
+        expand_clean=True,
+        enumerate_noisy=True,
     )
-    dm.prepare_data()
-    dm.setup()
-
-    ỹ = dm.datasets['noisy'].dataset.targets
-    T = dm.T if args.T is None else torch.load(args.T)
 
     if config['method'] == 'noisy-flexmatch':
-        model = NoisyFlexMatchClassifier(ỹ, T, **config)
+        T = torch.load(args.T)
+        model = NoisyFlexMatchClassifier(T=args.T, **config)
 
     trainer.fit(model, dm)
 
