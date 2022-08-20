@@ -2,7 +2,6 @@ import os
 import json
 import argparse
 
-import torch
 from pytorch_lightning import Trainer
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
@@ -60,7 +59,6 @@ def train(args):
     )
 
     if config['method'] == 'noisy-flexmatch':
-        T = torch.load(args.T)
         model = NoisyFlexMatchClassifier(T=args.T, **config)
 
     trainer.fit(model, dm)
