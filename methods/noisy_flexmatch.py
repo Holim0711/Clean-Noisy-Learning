@@ -18,7 +18,6 @@ class NoisyFlexMatchCrossEntropy(torch.nn.Module):
         super().__init__()
         self.threshold = threshold
         self.temperature = temperature
-        self.𝜇ₘₐₛₖ = None
 
         self.num_classes = num_classes
         self.num_samples = num_samples
@@ -27,16 +26,14 @@ class NoisyFlexMatchCrossEntropy(torch.nn.Module):
         self.Ỹ = torch.tensor([num_classes] * num_samples)
         self.Ŷ = torch.tensor([num_classes] * num_samples)
 
-        self.ones = torch.ones(num_samples)
-        # self.Dỹ = self.Ỹ.bincount().view(-1, 1) / self.num_samples
-
     def forward(self, logits_s, logits_w, ỹ):
         Tŷỹ = torch.zeros((self.num_classes + 1, self.num_classes))
-        Tŷỹ.index_put_((self.Ŷ, self.Ỹ), self.ones, True)
-        Tŷỹ = Tŷỹ[:-1] + 1  # try?: (self.Dỹ * Tŷỹ[-1])
+        Tŷỹ.index_put_((self.Ŷ, self.Ỹ), torch.tensor(1.), accumulate=True)
+        Tŷỹ = Tŷỹ[:-1] + 1
         Tŷỹ = Tŷỹ / Tŷỹ.sum(axis=1, keepdims=True)
 
         α = self.T / Tŷỹ
+        self.𝜇ₖₗ = (self.T * α.log()).nansum(axis=-1).mean().detach()
         α = α.t().to(ỹ.device)
 
         probs = torch.softmax(logits_w / self.temperature, dim=-1)
@@ -45,6 +42,7 @@ class NoisyFlexMatchCrossEntropy(torch.nn.Module):
         max_probs, targets = probs.max(dim=-1)
 
         β = self.Ŷ.bincount()
+        self.𝜇ₚₗ = (β[-1] / self.num_samples).detach()
         β = β / β.max()
         β = β / (2 - β)
         β = β.to(targets.device)
@@ -118,7 +116,9 @@ class NoisyFlexMatchClassifier(pl.LightningModule):
         return {'loss': loss,
                 'detail': {'loss_l': lossₗ.detach(),
                            'loss_u': lossᵤ.detach(),
-                           'mask': self.criterionᵤ.𝜇ₘₐₛₖ}}
+                           'mask': self.criterionᵤ.𝜇ₘₐₛₖ,
+                           'kl': self.criterionᵤ.𝜇ₖₗ,
+                           'pl': self.criterionᵤ.𝜇ₚₗ}}
 
     def optimizer_step(self, *args, **kwargs):
         super().optimizer_step(*args, **kwargs)
@@ -131,8 +131,12 @@ class NoisyFlexMatchClassifier(pl.LightningModule):
         self.log('train/acc', acc, rank_zero_only=True)
         self.train_acc.reset()
 
-        loss = torch.stack([x['detail']['mask'] for x in outputs]).mean()
-        self.log('detail/mask', loss, sync_dist=True)
+        𝜇ₘₐₛₖ = torch.stack([x['detail']['mask'] for x in outputs]).mean()
+        self.log('detail/mask', 𝜇ₘₐₛₖ, sync_dist=True)
+        𝜇ₖₗ = torch.stack([x['detail']['kl'] for x in outputs]).mean()
+        self.log('detail/kl', 𝜇ₖₗ, sync_dist=True)
+        𝜇ₚₗ = torch.stack([x['detail']['pl'] for x in outputs]).mean()
+        self.log('detail/pl', 𝜇ₚₗ, sync_dist=True)
         loss = torch.stack([x['detail']['loss_l'] for x in outputs]).mean()
         self.log('detail/loss_l', loss, sync_dist=True)
         loss = torch.stack([x['detail']['loss_u'] for x in outputs]).mean()
