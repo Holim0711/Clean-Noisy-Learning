@@ -1,6 +1,7 @@
 import os
 import numpy as np
 import torch
+import torch.nn.functional as F
 import pytorch_lightning as pl
 from torchmetrics import Accuracy
 from weaver.models import get_classifier
@@ -36,24 +37,29 @@ class NoisyFlexMatchCrossEntropy(torch.nn.Module):
         self.𝜇ₖₗ = (self.T * α.log()).nansum(axis=-1).mean().detach()
         α = α.t().to(ỹ.device)
 
-        probs = torch.softmax(logits_w / self.temperature, dim=-1)
-        probs *= α[ỹ]
-        probs /= probs.sum(dim=-1, keepdim=True)
-        max_probs, targets = probs.max(dim=-1)
+        probᵘ = torch.softmax(logits_w / self.temperature, dim=-1)
+        confᵘ, ŷᵘ = probᵘ.max(dim=-1)
+        probⁿ = F.normalize(probᵘ * α[ỹ], p=1)
+        confⁿ, ŷⁿ = probⁿ.max(dim=-1)
 
-        β = self.Ŷ.bincount()
-        self.𝜇ₚₗ = (β[-1] / self.num_samples).detach()
+        β = self.Ŷ.bincount(minlength=self.num_classes + 1)
+        self.𝜇ₚₗ = 1 - (β[self.num_classes] / self.num_samples).detach()
         β = β / β.max()
         β = β / (2 - β)
-        β = β.to(targets.device)
-        masks = (max_probs > self.threshold * β[targets]).float()
+        β = β.to(logits_w.device)
 
-        self.ŷ = torch.where(max_probs > self.threshold, targets, -1)
+        maskᵘ = confᵘ > self.threshold * β[ŷᵘ]
+        maskⁿ = confⁿ > self.threshold * β[ŷⁿ]
+        ŷ = torch.where(maskⁿ, ŷⁿ, ŷᵘ)
 
-        loss = torch.nn.functional.cross_entropy(
-            logits_s, targets, reduction='none') * masks
-        self.𝜇ₘₐₛₖ = masks.float().mean().detach()
+        # mask = maskⁿ.float()
+        mask = (maskᵘ | maskⁿ).float()
+        self.𝜇ₘₐₛₖ = mask.mean().detach()
 
+        # self.ŷ = torch.where(confⁿ > self.threshold, ŷⁿ, -1)
+        self.ŷ = torch.where(confᵘ > self.threshold, ŷᵘ, -1)
+
+        loss = F.cross_entropy(logits_s, ŷ, reduction='none') * mask
         return loss.mean()
 
 
