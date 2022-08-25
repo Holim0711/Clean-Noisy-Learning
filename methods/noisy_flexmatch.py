@@ -1,6 +1,7 @@
 import os
 import numpy as np
 import torch
+import torch.nn.functional as F
 import pytorch_lightning as pl
 from torchmetrics import Accuracy
 from weaver.models import get_classifier
@@ -37,22 +38,21 @@ class NoisyFlexMatchCrossEntropy(torch.nn.Module):
         α = α.t().to(ỹ.device)
 
         probs = torch.softmax(logits_w / self.temperature, dim=-1)
-        probs *= α[ỹ]
-        probs /= probs.sum(dim=-1, keepdim=True)
+        probs = F.normalize(probs * α[ỹ], p=1)
         max_probs, targets = probs.max(dim=-1)
 
-        β = self.Ŷ.bincount()
-        self.𝜇ₚₗ = (β[-1] / self.num_samples).detach()
+        β = self.Ŷ.bincount(minlength=self.num_classes + 1)
+        self.𝜇ₚₗ = 1 - (β[self.num_classes] / self.num_samples)
         β = β / β.max()
         β = β / (2 - β)
         β = β.to(targets.device)
+
         masks = (max_probs > self.threshold * β[targets]).float()
+        self.𝜇ₘₐₛₖ = masks.mean().detach()
 
         self.ŷ = torch.where(max_probs > self.threshold, targets, -1)
 
-        loss = torch.nn.functional.cross_entropy(
-            logits_s, targets, reduction='none') * masks
-        self.𝜇ₘₐₛₖ = masks.float().mean().detach()
+        loss = F.cross_entropy(logits_s, targets, reduction='none') * masks
 
         return loss.mean()
 
