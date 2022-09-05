@@ -30,7 +30,7 @@ class NoisyFlexMatchCrossEntropy(torch.nn.Module):
     def forward(self, logits_s, logits_w, ỹ):
         Tŷỹ = torch.zeros((self.num_classes + 1, self.num_classes))
         Tŷỹ.index_put_((self.Ŷ, self.Ỹ), torch.tensor(1.), accumulate=True)
-        Tŷỹ = Tŷỹ[:-1] + 1
+        Tŷỹ = Tŷỹ[:-1] + (Tŷỹ[-1] / self.num_classes) + 1
         Tŷỹ = Tŷỹ / Tŷỹ.sum(axis=1, keepdims=True)
 
         α = self.T / Tŷỹ
