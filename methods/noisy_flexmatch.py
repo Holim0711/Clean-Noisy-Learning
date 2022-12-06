@@ -3,7 +3,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import pytorch_lightning as pl
-from torchmetrics import Accuracy
+from torchmetrics.classification import MulticlassAccuracy
 from weaver import get_classifier, get_optimizer, get_scheduler
 from weaver.optimizers import exclude_wd, EMAModel
 from .utils import change_bn_momentum, replace_relu_to_lrelu
@@ -66,26 +66,25 @@ class NoisyFlexMatchClassifier(pl.LightningModule):
     def __init__(self, **kwargs):
         super().__init__()
         self.save_hyperparameters()
+        num_classes = self.hparams.model['backbone']['num_classes']
+        num_samples = {
+            'CIFAR10': 50000,
+            'CIFAR100': 50000,
+        }[self.hparams.dataset['name']]
 
         self.model = get_classifier(**self.hparams.model['backbone'])
         if a := self.hparams.model.get('lrelu'):
             replace_relu_to_lrelu(self.model, a)
         self.criterionₗ = torch.nn.CrossEntropyLoss()
         self.criterionᵤ = NoisyFlexMatchCrossEntropy(
-            self.hparams.model['backbone']['num_classes'],
-            {
-                'CIFAR10': 50000,
-                'CIFAR100': 50000,
-            }[self.hparams.dataset['name']],
-            **self.hparams.model['loss_u']
-        )
-        self.train_acc = Accuracy()
-        self.val_acc = Accuracy()
+            num_classes, num_samples, **self.hparams.model['loss_u'])
+        self.train_acc = MulticlassAccuracy(num_classes)
+        self.val_acc = MulticlassAccuracy(num_classes)
 
         if m := self.hparams.model.get('ema'):
             change_bn_momentum(self.model, m)
             self.ema = EMAModel(self.model, m)
-            self.val_acc_ema = Accuracy()
+            self.val_acc_ema = MulticlassAccuracy(num_classes)
 
     def training_step(self, batch, batch_idx):
         xₗ, yₗ = batch['clean']
