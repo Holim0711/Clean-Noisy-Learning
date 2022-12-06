@@ -4,11 +4,9 @@ import torch
 import torch.nn.functional as F
 import pytorch_lightning as pl
 from torchmetrics import Accuracy
-from weaver.models import get_classifier
-from weaver.optimizers import get_optim
-from weaver.optimizers.utils import exclude_wd
-from weaver.schedulers import get_sched
-from .utils import EMA, change_bn_momentum, replace_relu_to_lrelu
+from weaver import get_classifier, get_optimizer, get_scheduler
+from weaver.optimizers import exclude_wd, EMAModel
+from .utils import change_bn_momentum, replace_relu_to_lrelu
 
 __all__ = ['NoisyFlexMatchClassifier']
 
@@ -23,9 +21,15 @@ class NoisyFlexMatchCrossEntropy(torch.nn.Module):
         self.num_classes = num_classes
         self.num_samples = num_samples
 
-        self.T = torch.eye(num_classes)
-        self.Ỹ = torch.tensor([num_classes] * num_samples)
         self.Ŷ = torch.tensor([num_classes] * num_samples)
+
+    def initialize_constants(self, transition_matrix, noisy_targets):
+        if not isinstance(transition_matrix, torch.Tensor):
+            transition_matrix = torch.tensor(transition_matrix)
+        if not isinstance(noisy_targets, torch.Tensor):
+            noisy_targets = torch.tensor(noisy_targets)
+        self.T = transition_matrix
+        self.Ỹ = noisy_targets
 
     def forward(self, logits_s, logits_w, ỹ):
         Tŷỹ = torch.zeros((self.num_classes + 1, self.num_classes))
@@ -80,16 +84,8 @@ class NoisyFlexMatchClassifier(pl.LightningModule):
 
         if m := self.hparams.model.get('ema'):
             change_bn_momentum(self.model, m)
-            self.ema = EMA(self.model, m)
+            self.ema = EMAModel(self.model, m)
             self.val_acc_ema = Accuracy()
-
-    def on_train_start(self):
-        self.criterionᵤ.T = torch.load(self.hparams.T)
-        self.criterionᵤ.Ỹ = torch.from_numpy(np.load(os.path.join(
-            'data', self.hparams.dataset['name'], 'noisy') +
-            f"-{self.hparams.dataset['noise_type']}" +
-            f"-{self.hparams.dataset['noise_ratio']}" +
-            f"-{self.hparams.dataset['random_seed']}.npy"))
 
     def training_step(self, batch, batch_idx):
         xₗ, yₗ = batch['clean']
@@ -178,7 +174,7 @@ class NoisyFlexMatchClassifier(pl.LightningModule):
         return self.validation_epoch_end(outputs)
 
     def configure_optimizers(self):
-        params = exclude_wd(self.model)
-        optim = get_optim(params, **self.hparams.optimizer)
-        sched = get_sched(optim, **self.hparams.scheduler)
+        param = exclude_wd(self.model)
+        optim = get_optimizer(param, **self.hparams.optimizer)
+        sched = get_scheduler(optim, **self.hparams.scheduler)
         return {'optimizer': optim, 'lr_scheduler': {'scheduler': sched}}
