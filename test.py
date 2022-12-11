@@ -1,48 +1,46 @@
 import os
-import json
-import argparse
+import sys
 
 from torchvision.datasets import CIFAR10, CIFAR100
 from torch.utils.data import DataLoader
 from pytorch_lightning import Trainer
+from pytorch_lightning.utilities.argparse import parse_env_variables
 
 from methods import NoisyFlexMatchClassifier
-from weaver.transforms import get_xform
+from torchvision.transforms import Compose
+from weaver import get_transforms
 
 
-def test(args):
-    config = args.config
+def test(ckpt):
+    trainer = Trainer(**vars(parse_env_variables(Trainer)))
 
-    trainer = Trainer.from_argparse_args(args, logger=False)
+    model = NoisyFlexMatchClassifier.load_from_checkpoint(ckpt)
+    transform = Compose(get_transforms(model.hparams.transform['val']))
+
+    dataset_name = model.hparams.dataset['name']
+    batch_size = model.hparams.dataset['batch_size']
 
     Dataset = {
         'CIFAR10': CIFAR10,
         'CIFAR100': CIFAR100,
-    }[config['dataset']['name']]
+    }[dataset_name]
 
     dataset = Dataset(
-        root=os.path.join('data', config['dataset']['name']),
+        root=os.path.join('data', dataset_name),
         train=False,
-        transform=get_xform('Compose', transforms=config['transform']['val'])
+        transform=transform
     )
 
     dataloader = DataLoader(
         dataset,
-        batch_size=config['dataset']['batch_sizes']['val'],
+        batch_size=batch_size['clean'] + batch_size['noisy'],
         shuffle=False,
         num_workers=os.cpu_count(),
         pin_memory=True
     )
 
-    model = NoisyFlexMatchClassifier.load_from_checkpoint(args.checkpoint)
     trainer.test(model, dataloader)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument('config', type=lambda x: json.load(open(x)))
-    parser.add_argument('checkpoint', type=str)
-    parser = Trainer.add_argparse_args(parser)
-
-    args = parser.parse_args()
-    test(args)
+    test(sys.argv[1])
