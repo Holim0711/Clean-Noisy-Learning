@@ -1,1 +1,1 @@
-from .noisy_flexmatch import NoisyFlexMatchClassifier
+from .noisy_flexmatch import NoisyFlexMatchModule

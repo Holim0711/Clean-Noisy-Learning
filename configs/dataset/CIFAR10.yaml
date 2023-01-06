@@ -1,0 +1,8 @@
+name: CIFAR10
+root: /datasets/CIFAR10
+num_classes: 10
+num_samples: 50000
+num_clean: 100
+noise_type: symmetric
+noise_level: 0.2
+random_seed: 0

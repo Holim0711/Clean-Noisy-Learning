@@ -131,6 +131,7 @@ dmypy.json
 # This Repo
 .vscode
 lightning_logs/
+outputs/
+transition_matrix/*/*.pth
 logs/
-data/
 .history

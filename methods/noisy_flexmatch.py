@@ -1,12 +1,7 @@
-import os
-import numpy as np
 import torch
 import torch.nn.functional as F
-import pytorch_lightning as pl
 from torchmetrics.classification import MulticlassAccuracy
-from weaver import get_classifier, get_optimizer, get_scheduler
-from weaver.optimizers import exclude_wd, EMAModel
-from .utils import change_bn_momentum, replace_relu_to_lrelu
+from .base import BaseModule
 
 __all__ = ['NoisyFlexMatchClassifier']
 
@@ -15,165 +10,107 @@ class NoisyFlexMatchCrossEntropy(torch.nn.Module):
 
     def __init__(self, num_classes, num_samples, temperature, threshold):
         super().__init__()
-        self.threshold = threshold
-        self.temperature = temperature
-
         self.num_classes = num_classes
         self.num_samples = num_samples
+        self.temperature = temperature
+        self.threshold = threshold
+        self.χ2 = float('inf')
+        self.𝜇 = 0.0
+        self.register_buffer('Ŷ', torch.tensor([num_classes] * num_samples))
 
-        self.Ŷ = torch.tensor([num_classes] * num_samples)
+    def register_transition_matrix(self, T):
+        T = T if isinstance(T, torch.Tensor) else torch.tensor(T)
+        assert T.shape == (self.num_classes, self.num_classes)
+        assert torch.isclose(T.sum(axis=1), torch.tensor(1.)).all()
+        self.register_buffer('T', T)
 
-    def initialize_constants(self, transition_matrix, noisy_targets):
-        if not isinstance(transition_matrix, torch.Tensor):
-            transition_matrix = torch.tensor(transition_matrix)
-        if not isinstance(noisy_targets, torch.Tensor):
-            noisy_targets = torch.tensor(noisy_targets)
-        self.T = transition_matrix
-        self.Ỹ = noisy_targets
+    def register_clean_label_info(self, Y):
+        Y = Y if isinstance(Y, torch.Tensor) else torch.tensor(Y)
+        assert (Y.unique() == torch.arange(self.num_classes)).all()
+        self.register_buffer('Py', Y.bincount() / len(Y))
+
+    def register_noisy_label_info(self, Ỹ):
+        Ỹ = Ỹ if isinstance(Ỹ, torch.Tensor) else torch.tensor(Ỹ)
+        assert len(Ỹ) == self.num_samples
+        assert (Ỹ.unique() == torch.arange(self.num_classes)).all()
+        self.register_buffer('Ỹ', Ỹ)
+        self.register_buffer('Pỹ', Ỹ.bincount() / len(Ỹ))
+
+    def prepare_constants(self):
+        self.register_buffer('err_bnd', self.Pỹ * (1 - self.threshold) / self.Py.unsqueeze(-1))
 
     def forward(self, logits_s, logits_w, ỹ):
-        Tŷỹ = torch.zeros((self.num_classes + 1, self.num_classes))
-        Tŷỹ.index_put_((self.Ŷ, self.Ỹ), torch.tensor(1.), accumulate=True)
-        Tŷỹ = Tŷỹ[:-1] + (Tŷỹ[-1] / self.num_classes) + 1
-        Tŷỹ = Tŷỹ / Tŷỹ.sum(axis=1, keepdims=True)
+        T = torch.zeros((self.num_classes + 1, self.num_classes), dtype=int, device=self.Ŷ.device)
+        T.index_put_((self.Ŷ, self.Ỹ), torch.tensor(1), accumulate=True)
+        T = T[:-1] + T[-1] * self.Py.unsqueeze(-1) + 1
+        T /= T.sum(axis=1, keepdims=True)
 
-        α = self.T / Tŷỹ
-        self.𝜇ₖₗ = (self.T * α.log()).nansum(axis=-1).mean().detach()
-        α = α.t().to(ỹ.device)
+        α = self.T / T
+        self.χ2 = ((α * self.T).sum(dim=-1) * self.Py).sum() - 1
+        α = (α - 1) * ((self.T - T).abs() > self.err_bnd) + 1
 
-        probs = torch.softmax(logits_w / self.temperature, dim=-1)
-        probs = F.normalize(probs * α[ỹ], p=1)
-        max_probs, targets = probs.max(dim=-1)
+        z = (logits_w / self.temperature).softmax(dim=-1) * α.t()[ỹ]
+        c, ŷ = F.normalize(z, p=1).max(dim=-1)
+        self.ŷ = torch.where(c > self.threshold, ŷ, -1)
 
+        torch.use_deterministic_algorithms(False)
         β = self.Ŷ.bincount(minlength=self.num_classes + 1)
-        self.𝜇ₚₗ = 1 - (β[self.num_classes] / self.num_samples)
-        β = β / β.max()
-        β = β / (2 - β)
-        β = β.to(targets.device)
+        torch.use_deterministic_algorithms(True)
+        β = β / (2 * β.max() - β)
 
-        masks = (max_probs > self.threshold * β[targets]).float()
-        self.𝜇ₘₐₛₖ = masks.mean().detach()
+        mask = (c > self.threshold * β[ŷ])
+        self.𝜇 = mask.float().mean()
 
-        self.ŷ = torch.where(max_probs > self.threshold, targets, -1)
-
-        loss = F.cross_entropy(logits_s, targets, reduction='none') * masks
-
-        return loss.mean()
+        loss = F.cross_entropy(logits_s, ŷ, reduction='none')
+        return (loss * mask).mean()
 
 
-class NoisyFlexMatchClassifier(pl.LightningModule):
+class NoisyFlexMatchModule(BaseModule):
 
     def __init__(self, **kwargs):
         super().__init__()
-        self.save_hyperparameters()
-        num_classes = self.hparams.model['backbone']['num_classes']
-        num_samples = {
-            'CIFAR10': 50000,
-            'CIFAR100': 50000,
-        }[self.hparams.dataset['name']]
+        self.criterionᶜ = torch.nn.CrossEntropyLoss()
+        self.criterionⁿ = NoisyFlexMatchCrossEntropy(
+            self.hparams['dataset']['num_classes'],
+            self.hparams['dataset']['num_samples'],
+            self.hparams.method['temperature'],
+            self.hparams.method['threshold'])
+        self.train_accuracy = MulticlassAccuracy(
+            self.hparams['dataset']['num_classes'])
 
-        self.model = get_classifier(**self.hparams.model['backbone'])
-        if a := self.hparams.model.get('lrelu'):
-            replace_relu_to_lrelu(self.model, a)
-        self.criterionₗ = torch.nn.CrossEntropyLoss()
-        self.criterionᵤ = NoisyFlexMatchCrossEntropy(
-            num_classes, num_samples, **self.hparams.model['loss_u'])
-        self.train_acc = MulticlassAccuracy(num_classes)
-        self.val_acc = MulticlassAccuracy(num_classes)
-
-        if m := self.hparams.model.get('ema'):
-            change_bn_momentum(self.model, m)
-            self.ema = EMAModel(self.model, m)
-            self.val_acc_ema = MulticlassAccuracy(num_classes)
+    def custom_init(self, T, Y, Ỹ):
+        self.criterionⁿ.register_transition_matrix(T)
+        self.criterionⁿ.register_clean_label_info(Y)
+        self.criterionⁿ.register_noisy_label_info(Ỹ)
+        self.criterionⁿ.prepare_constants()
 
     def training_step(self, batch, batch_idx):
-        xₗ, yₗ = batch['clean']
-        iᵤ, ((ˢxᵤ, ʷxᵤ), ỹ) = batch['noisy']
+        iᶜ, (xᶜ, yᶜ) = batch['clean']
+        iⁿ, ((xʷ, xˢ), yⁿ) = batch['noisy']
+        bᶜ, bⁿ = len(iᶜ), len(iⁿ)
 
-        z = self.model(torch.cat((xₗ, ˢxᵤ, ʷxᵤ)))
-        zₗ = z[:xₗ.shape[0]]
-        ˢzᵤ, ʷzᵤ = z[xₗ.shape[0]:].chunk(2)
-        del z
+        zᶜ, zʷ, zˢ = self.model(torch.cat((xᶜ, xʷ, xˢ))).split([bᶜ, bⁿ, bⁿ])
 
-        lossₗ = self.criterionₗ(zₗ, yₗ)
-        lossᵤ = self.criterionᵤ(ˢzᵤ, ʷzᵤ.detach(), ỹ)
-        loss = lossₗ + lossᵤ
+        lossᶜ = self.criterionᶜ(zᶜ, yᶜ)
+        lossⁿ = self.criterionⁿ(zˢ, zʷ.detach(), yⁿ)
+        loss = lossᶜ + lossⁿ
 
-        ŷᵤ = self.criterionᵤ.ŷ
+        self.log('train/loss', loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=bᶜ + bⁿ)
+        self.log('train/loss_c', lossᶜ, on_step=False, on_epoch=True, sync_dist=True, batch_size=bᶜ)
+        self.log('train/loss_n', lossⁿ, on_step=False, on_epoch=True, sync_dist=True, batch_size=bⁿ)
+        self.log('train/mask', self.criterionⁿ.𝜇, on_step=False, on_epoch=True, sync_dist=True, batch_size=bⁿ)
+        self.log('train/chidiv', self.criterionⁿ.χ2, on_step=False, on_epoch=True, sync_dist=True, batch_size=bⁿ)
+        self.train_accuracy.update(zᶜ, yᶜ)
+        return {'loss': loss}
+
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        ĩ = batch['noisy'][0]
+        ŷ = self.criterionⁿ.ŷ
         if torch.distributed.is_initialized():
-            iᵤ = self.all_gather(iᵤ).flatten(end_dim=1)
-            ŷᵤ = self.all_gather(ŷᵤ).flatten(end_dim=1)
-        iᵤ = iᵤ.cpu()
-        ŷᵤ = ŷᵤ.cpu()
-        self.criterionᵤ.Ŷ[iᵤ[ŷᵤ != -1]] = ŷᵤ[ŷᵤ != -1]
+            ĩ = self.all_gather(ĩ).flatten(end_dim=1)
+            ŷ = self.all_gather(ŷ).flatten(end_dim=1)
+        self.criterionⁿ.Ŷ[ĩ[ŷ != -1]] = ŷ[ŷ != -1]
 
-        self.train_acc.update(zₗ.softmax(dim=1), yₗ)
-        return {'loss': loss,
-                'detail': {'loss_l': lossₗ.detach(),
-                           'loss_u': lossᵤ.detach(),
-                           'mask': self.criterionᵤ.𝜇ₘₐₛₖ,
-                           'kl': self.criterionᵤ.𝜇ₖₗ,
-                           'pl': self.criterionᵤ.𝜇ₚₗ}}
-
-    def optimizer_step(self, *args, **kwargs):
-        super().optimizer_step(*args, **kwargs)
-        self.ema.update_parameters(self.model)
 
     def training_epoch_end(self, outputs):
-        loss = torch.stack([x['loss'] for x in outputs]).mean()
-        self.log('train/loss', loss, sync_dist=True)
-        acc = self.train_acc.compute()
-        self.log('train/acc', acc, rank_zero_only=True)
-        self.train_acc.reset()
-
-        𝜇ₘₐₛₖ = torch.stack([x['detail']['mask'] for x in outputs]).mean()
-        self.log('detail/mask', 𝜇ₘₐₛₖ, sync_dist=True)
-        𝜇ₖₗ = torch.stack([x['detail']['kl'] for x in outputs]).mean()
-        self.log('detail/kl', 𝜇ₖₗ, sync_dist=True)
-        𝜇ₚₗ = torch.stack([x['detail']['pl'] for x in outputs]).mean()
-        self.log('detail/pl', 𝜇ₚₗ, sync_dist=True)
-        loss = torch.stack([x['detail']['loss_l'] for x in outputs]).mean()
-        self.log('detail/loss_l', loss, sync_dist=True)
-        loss = torch.stack([x['detail']['loss_u'] for x in outputs]).mean()
-        self.log('detail/loss_u', loss, sync_dist=True)
-
-    def validation_step(self, batch, batch_idx):
-        x, y = batch
-        z = self.model(x)
-        loss = self.criterionₗ(z, y)
-        self.val_acc.update(z.softmax(dim=1), y)
-        results = {'loss': loss}
-
-        if self.hparams.model.get('ema'):
-            z = self.ema(x)
-            loss = self.criterionₗ(z, y)
-            self.val_acc_ema.update(z.softmax(dim=1), y)
-            results['loss/ema'] = loss
-
-        return results
-
-    def validation_epoch_end(self, outputs):
-        loss = torch.stack([x['loss'] for x in outputs]).mean()
-        self.log('val/loss', loss, sync_dist=True)
-        acc = self.val_acc.compute()
-        self.log('val/acc', acc, rank_zero_only=True)
-        self.val_acc.reset()
-
-        if self.hparams.model.get('ema'):
-            loss = torch.stack([x['loss/ema'] for x in outputs]).mean()
-            self.log('val/loss/ema', loss, sync_dist=True)
-            acc = self.val_acc_ema.compute()
-            self.log('val/acc/ema', acc, rank_zero_only=True)
-            self.val_acc_ema.reset()
-
-    def test_step(self, batch, batch_idx):
-        return self.validation_step(batch, batch_idx)
-
-    def test_epoch_end(self, outputs):
-        return self.validation_epoch_end(outputs)
-
-    def configure_optimizers(self):
-        param = exclude_wd(self.model)
-        optim = get_optimizer(param, **self.hparams.optimizer)
-        sched = get_scheduler(optim, **self.hparams.scheduler)
-        return {'optimizer': optim, 'lr_scheduler': {'scheduler': sched}}
+        self.log('train/acc', self.train_accuracy)

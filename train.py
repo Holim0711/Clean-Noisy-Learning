@@ -1,121 +1,69 @@
-import os
-import json
-import argparse
-from math import ceil
-
-from pytorch_lightning import Trainer
-from pytorch_lightning.loggers import TensorBoardLogger
-from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
-from pytorch_lightning.utilities.argparse import parse_env_variables
-from lightning_lite import seed_everything
+import hydra
 import torch
-from torch.utils.data import DataLoader, ConcatDataset
-from torchvision.datasets import CIFAR10, CIFAR100
+from pytorch_lightning import Trainer
+from pytorch_lightning.utilities.argparse import parse_env_variables
+from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
+from lightning_lite import seed_everything
 from torchvision.transforms import Compose, Lambda
 from weaver import get_transforms
-from weaver.datasets import RandomSubset, IndexedDataset
-from noisy_cifar import NoisyCIFAR10, NoisyCIFAR100
 
-from methods import NoisyFlexMatchClassifier
+from methods import NoisyFlexMatchModule
+from datasets import CIFAR10DataModule, CIFAR100DataModule
 
 
-def train(hparams):
-    seed_everything(hparams.get('random_seed', 0))
+@hydra.main(config_path='configs', version_base=None)
+def main(config):
+    seed_everything(config['random_seed'])
 
     trainer = Trainer(
         **vars(parse_env_variables(Trainer)),
-        logger=TensorBoardLogger('logs', hparams['dataset']['name']),
         callbacks=[
-            ModelCheckpoint(save_top_k=1, monitor='val/acc/ema', mode='max'),
+            ModelCheckpoint(monitor='val/acc', mode='max'),
             LearningRateMonitor(),
         ]
     )
 
-    transform_w = Compose(get_transforms(hparams['transform']['weak']))
-    transform_s = Compose(get_transforms(hparams['transform']['strong']))
-    transform_v = Compose(get_transforms(hparams['transform']['val']))
-
-    CleanDataset, NoisyDataset = {
-        'CIFAR10': (CIFAR10, NoisyCIFAR10),
-        'CIFAR100': (CIFAR100, NoisyCIFAR100)
-    }[hparams['dataset']['name']]
-
-    noisy_dataset = NoisyDataset(
-        hparams['dataset']['root'],
-        hparams['dataset']['noise_type'],
-        hparams['dataset']['noise_level'],
-        hparams['dataset']['random_seed'],
-        transform=Lambda(lambda x: (transform_s(x), transform_w(x))),
-    )
-    noisy_dataset = IndexedDataset(noisy_dataset)
-
-    clean_dataset = CleanDataset(
-        hparams['dataset']['root'],
-        transform=transform_w,
-    )
-    clean_dataset = RandomSubset(
-        clean_dataset,
-        hparams['dataset']['num_clean'],
-        class_balanced=True,
-        random_seed=hparams['dataset']['random_seed'],
-    )
-    batch_size = hparams['dataset']['batch_size']
-    noisy_num_iters = len(noisy_dataset) / batch_size['noisy']
-    clean_num_iters = len(clean_dataset) / batch_size['clean']
-    m = ceil(noisy_num_iters / (clean_num_iters * 2))
-    clean_dataset = ConcatDataset([clean_dataset] * m)
-
-    val_dataset = CleanDataset(
-        hparams['dataset']['root'],
-        train=False,
-        transform=transform_v,
-    )
-
-    noisy_dataloader = DataLoader(
-        noisy_dataset, batch_size['noisy'],
-        shuffle=True, num_workers=os.cpu_count(), pin_memory=True)
-    clean_dataloader = DataLoader(
-        clean_dataset, batch_size['clean'],
-        shuffle=False, num_workers=os.cpu_count(), pin_memory=True)
-    train_dataloader = {
-        'clean': clean_dataloader,
-        'noisy': noisy_dataloader,
+    transform_w = Compose(get_transforms(config['transform']['weak']))
+    transform_s = Compose(get_transforms(config['transform']['strong']))
+    transform_v = Compose(get_transforms(config['transform']['val']))
+    transforms = {
+        'clean': transform_w,
+        'noisy': Lambda(lambda x: (transform_w(x), transform_s(x))),
+        'val': transform_v,
     }
-    val_dataloader = DataLoader(
-        val_dataset, batch_size['clean'] + batch_size['noisy'],
-        shuffle=False, num_workers=os.cpu_count(), pin_memory=True)
 
-    if hparams['method'] == 'noisy-flexmatch':
-        model = NoisyFlexMatchClassifier(**hparams)
-        model.criterionᵤ.initialize_constants(
-            torch.load(os.path.join(
-                'transition_matrix',
-                hparams['dataset']['name'],
-                hparams['dataset']['noise_type']
-                + f"-{hparams['dataset']['noise_level']}"
-                + f"-{hparams['dataset']['random_seed']}.pth"
-            ))['inv_cur_h'],
-            noisy_dataset.dataset.targets
-        )
+    batch_sizes = config['batch_size']
+    batch_sizes = {k: v // trainer.num_devices for k, v in batch_sizes.items()}
 
-    trainer.fit(model, train_dataloader, val_dataloader)
+    if config['dataset']['name'] == 'CIFAR10':
+        dm = CIFAR10DataModule(
+            config['dataset']['root'],
+            config['dataset']['num_clean'],
+            config['dataset']['noise_type'],
+            config['dataset']['noise_level'],
+            transforms=transforms,
+            batch_sizes=batch_sizes,
+            random_seed=config['dataset']['random_seed'])
+    elif config['dataset']['name'] == 'CIFAR100':
+        dm = CIFAR100DataModule(
+            config['dataset']['root'],
+            config['dataset']['num_clean'],
+            config['dataset']['noise_type'],
+            config['dataset']['noise_level'],
+            transforms=transforms,
+            batch_sizes=batch_sizes,
+            random_seed=config['dataset']['random_seed'])
+
+    if config['method']['name'] == 'NoisyFlexMatch':
+        model = NoisyFlexMatchModule(**config)
+        path= 'transition_matrix/{name}/{noise_type}-{noise_level}-{random_seed}.pth'.format(**config['dataset'])
+        T = torch.load(path)['inv_cur_h']
+        Y = [int(y) for _, y in dm.get_raw_dataset('clean')]
+        Ỹ = [int(y) for _, y in dm.get_raw_dataset('noisy')]
+        model.custom_init(T, Y, Ỹ)
+
+    trainer.fit(model, dm)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument('config', type=lambda x: json.load(open(x)))
-    parser.add_argument('--dataset.noise_type',
-                        choices=['symmetric', 'asymmetric', 'human'])
-    parser.add_argument('--dataset.noise_level',
-                        type=lambda x: float(x) if x.startswith('0.') else x)
-    parser.add_argument('--dataset.random_seed', type=int)
-
-    args = parser.parse_args()
-    if (v := getattr(args, 'dataset.noise_type')) is not None:
-        args.config['dataset']['noise_type'] = v
-    if (v := getattr(args, 'dataset.noise_level')) is not None:
-        args.config['dataset']['noise_level'] = v
-    if (v := getattr(args, 'dataset.random_seed')) is not None:
-        args.config['dataset']['random_seed'] = v
-
-    train(args.config)
+    main()
